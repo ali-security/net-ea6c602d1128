@@ -60,43 +60,42 @@ func TestTakeInflows(t *testing.T) {
 
 func TestOutFlow(t *testing.T) {
 	var st outflow
-	var conn outflow
+	var conn connOutflow
+	st.conn = &conn
 	st.add(3)
 	conn.add(2)
 
-	if got, want := st.available(), int32(3); got != want {
-		t.Errorf("available = %d; want %d", got, want)
-	}
-	st.setConnFlow(&conn)
-	if got, want := st.available(), int32(2); got != want {
-		t.Errorf("after parent setup, available = %d; want %d", got, want)
+	if got, ok := st.available(); !ok || got != 2 {
+		t.Errorf("available = %d, %v; want 2, true", got, ok)
 	}
 
 	st.take(2)
-	if got, want := conn.available(), int32(0); got != want {
+	if got, want := conn.n, int32(0); got != want {
 		t.Errorf("after taking 2, conn = %d; want %d", got, want)
 	}
-	if got, want := st.available(), int32(0); got != want {
-		t.Errorf("after taking 2, stream = %d; want %d", got, want)
+	if got, ok := st.available(); !ok || got != 0 {
+		t.Errorf("after taking 2, stream = %d, %v; want 0, true", got, ok)
 	}
 }
 
 func TestOutFlowAdd(t *testing.T) {
 	var f outflow
+	f.conn = &connOutflow{}
+	f.conn.add(1<<31 - 1)
 	if !f.add(1) {
 		t.Fatal("failed to add 1")
 	}
 	if !f.add(-1) {
 		t.Fatal("failed to add -1")
 	}
-	if got, want := f.available(), int32(0); got != want {
-		t.Fatalf("size = %d; want %d", got, want)
+	if got, ok := f.available(); !ok || got != 0 {
+		t.Fatalf("size = %d, %v; want 0, true", got, ok)
 	}
 	if !f.add(1<<31 - 1) {
 		t.Fatal("failed to add 2^31-1")
 	}
-	if got, want := f.available(), int32(1<<31-1); got != want {
-		t.Fatalf("size = %d; want %d", got, want)
+	if got, ok := f.available(); !ok || got != 1<<31-1 {
+		t.Fatalf("size = %d, %v; want %d, true", got, ok, 1<<31-1)
 	}
 	if f.add(1) {
 		t.Fatal("adding 1 to max shouldn't be allowed")
@@ -105,6 +104,8 @@ func TestOutFlowAdd(t *testing.T) {
 
 func TestOutFlowAddOverflow(t *testing.T) {
 	var f outflow
+	f.conn = &connOutflow{}
+	f.conn.add(1<<31 - 1)
 	if !f.add(0) {
 		t.Fatal("failed to add 0")
 	}
@@ -126,14 +127,78 @@ func TestOutFlowAddOverflow(t *testing.T) {
 	if !f.add(-3) {
 		t.Fatal("failed to add -3")
 	}
-	if got, want := f.available(), int32(-2); got != want {
-		t.Fatalf("size = %d; want %d", got, want)
+	if got, ok := f.available(); !ok || got != -2 {
+		t.Fatalf("size = %d, %v; want -2, true", got, ok)
 	}
 	if !f.add(1<<31 - 1) {
 		t.Fatal("failed to add 2^31-1")
 	}
-	if got, want := f.available(), int32(1+-3+(1<<31-1)); got != want {
-		t.Fatalf("size = %d; want %d", got, want)
+	if got, ok := f.available(); !ok || got != 1+-3+(1<<31-1) {
+		t.Fatalf("size = %d, %v; want %d, true", got, ok, 1+-3+(1<<31-1))
 	}
 
+}
+
+// Changing SETTINGS_INITIAL_WINDOW_SIZE applies to every stream sharing the
+// connection without visiting or modifying any per-stream state.
+func TestConnOutflowChangeInitialWindowSize(t *testing.T) {
+	var conn connOutflow
+	conn.init()
+	conn.add(maxFlowWindow - initialWindowSize) // conn-level flow is large
+	streams := make([]outflow, 10)
+	for i := range streams {
+		streams[i].conn = &conn
+	}
+	const windowIncrease = 1000
+	if !streams[0].add(windowIncrease) {
+		t.Fatalf("failed to add %v", windowIncrease)
+	}
+
+	for _, size := range []int64{0, 1, 1 << 20, initialWindowSize, maxFlowWindow - windowIncrease} {
+		if !conn.changeInitialWindowSize(size) {
+			t.Fatalf("changeInitialWindowSize(%v) = false, want true", size)
+		}
+		for i := range streams {
+			want := int32(size)
+			wantDelta := int32(0)
+			if i == 0 {
+				want += windowIncrease
+				wantDelta = windowIncrease
+			}
+			if got, ok := streams[i].available(); !ok || got != want {
+				t.Fatalf("initial window %v: stream %v available = %v, %v; want %v, true", size, i, got, ok, want)
+			}
+			if got := streams[i].delta; got != wantDelta {
+				t.Fatalf("initial window %v: stream %v delta = %v; want %v", size, i, got, wantDelta)
+			}
+		}
+	}
+	if conn.flowErr {
+		t.Fatalf("flowErr = true, want false")
+	}
+
+	// A valid initial window size which pushes a stream over the limit
+	// is detected lazily, and then blocks all sending on the connection.
+	if !conn.changeInitialWindowSize(maxFlowWindow) {
+		t.Fatalf("changeInitialWindowSize(%v) = false, want true", maxFlowWindow)
+	}
+	if got, ok := streams[1].available(); !ok || got != maxFlowWindow {
+		t.Fatalf("stream 1 available = %v, %v; want %v, true", got, ok, maxFlowWindow)
+	}
+	if got, ok := streams[0].available(); ok || got != 0 {
+		t.Fatalf("stream 0 available = %v, %v; want 0, false", got, ok)
+	}
+	if !conn.flowErr {
+		t.Fatalf("flowErr = false, want true")
+	}
+	if got, ok := streams[1].available(); ok || got != 0 {
+		t.Fatalf("after flow control error, stream 1 available = %v, %v; want 0, false", got, ok)
+	}
+
+	// An initial window size above the maximum is rejected.
+	var conn2 connOutflow
+	conn2.init()
+	if conn2.changeInitialWindowSize(maxFlowWindow + 1) {
+		t.Fatalf("changeInitialWindowSize(%v) = true, want false", int64(maxFlowWindow+1))
+	}
 }

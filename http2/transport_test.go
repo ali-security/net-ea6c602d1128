@@ -1876,6 +1876,135 @@ func testTransportResponseHeaderTimeout(t *testing.T, body bool) {
 	}
 }
 
+// "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE
+// that causes any flow-control window to exceed the maximum size as
+// a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR."
+// -- https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2-7
+func TestTransportSettingsFlowControlUpdateBeyondLimit(t *testing.T) {
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	body := tc.newRequestBody()
+	req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
+	rt := tc.roundTrip(req)
+	tc.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	tc.writeWindowUpdate(rt.streamID(), windowIncrease)
+	tc.wantIdle()
+
+	// Adjust the initial flow control window. The stream is now over the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	tc.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize + 1})
+	tc.wantSettingsAck()
+
+	// We detect this condition lazily. Write something to the stream so we notice.
+	body.writeBytes(1)
+	body.closeWithError(io.EOF)
+
+	tc.wantGoAway(0, ErrCodeFlowControl)
+}
+
+// Counterpart to TestTransportSettingsFlowControlUpdateBeyondLimit:
+// A SETTINGS update which doesn't quite put a stream over the flow control limit.
+func TestTransportSettingsFlowControlUpdateWithinLimit(t *testing.T) {
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	body := tc.newRequestBody()
+	req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
+	rt := tc.roundTrip(req)
+	tc.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	tc.writeWindowUpdate(rt.streamID(), windowIncrease)
+	tc.wantIdle()
+
+	// Adjust the initial flow control window. The stream is just within the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	tc.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize})
+	tc.wantSettingsAck()
+
+	body.writeBytes(1)
+	body.closeWithError(io.EOF)
+	tc.wantData(wantData{
+		streamID:  1,
+		endStream: true,
+		size:      1,
+		multiple:  true,
+	})
+	tc.wantIdle()
+}
+
+// A peer which opens many streams and then sends many SETTINGS frames
+// changing SETTINGS_INITIAL_WINDOW_SIZE must not cause per-stream work
+// for each setting. The initial window size is tracked once at the
+// connection level, and per-stream flow control state is left untouched.
+func TestTransportSettingsInitialWindowSizeManyStreams(t *testing.T) {
+	const numStreams = 20
+	const numSettings = 20
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	for i := 0; i < numStreams; i++ {
+		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
+		tc.roundTrip(req)
+		tc.wantFrameType(FrameHeaders)
+	}
+
+	var size uint32
+	for i := 0; i < numSettings; i++ {
+		size = uint32(1000 + i)
+		tc.writeSettings(Setting{SettingInitialWindowSize, size})
+		tc.wantSettingsAck()
+	}
+
+	cc := tc.cc
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if got, want := len(cc.streams), numStreams; got != want {
+		t.Errorf("open streams = %v, want %v", got, want)
+	}
+	if got, want := cc.flow.initial, int32(size); got != want {
+		t.Errorf("conn initial window size = %v, want %v", got, want)
+	}
+	for id, cs := range cc.streams {
+		if cs.flow.delta != 0 {
+			t.Errorf("stream %v: SETTINGS modified per-stream flow control state: delta = %v, want 0", id, cs.flow.delta)
+		}
+		if got, ok := cs.flow.available(); !ok || got != int32(size) {
+			t.Errorf("stream %v: available = %v, %v; want %v, true", id, got, ok, size)
+		}
+	}
+}
+
+// A WINDOW_UPDATE which pushes a stream's flow control window past the
+// maximum is a stream error. The stream is reset, and the connection
+// remains usable.
+func TestTransportStreamWindowUpdateBeyondLimit(t *testing.T) {
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
+	rt := tc.roundTrip(req)
+	tc.wantFrameType(FrameHeaders)
+
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	tc.writeWindowUpdate(rt.streamID(), maxWindowSize)
+	tc.wantRSTStream(rt.streamID(), ErrCodeFlowControl)
+	if err := rt.err(); err == nil {
+		t.Fatalf("RoundTrip succeeded; want error")
+	}
+
+	// Connection is still alive, even if the stream has been reset.
+	tc.writePing(false, [8]byte{})
+	tc.wantFrameType(FramePing)
+}
+
 func TestTransportDisableCompression(t *testing.T) {
 	const body = "sup"
 	ts := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
