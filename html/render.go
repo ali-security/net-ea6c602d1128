@@ -243,8 +243,23 @@ func childTextNodesAreLiteral(n *Node) bool {
 	if n.Namespace != "" {
 		return false
 	}
+
 	switch n.Data {
 	case "iframe", "noembed", "noframes", "noscript", "plaintext", "script", "style", "xmp":
+		// n's text is literal only if the parser would keep n in the HTML
+		// namespace when the output is re-parsed. An ancestor may have been
+		// fostered under a foreign element (such as an HTML <mglyph> under
+		// <mtext>) where the parser would instead create it, and its
+		// descendants, in that element's namespace. We walk up the whole tree
+		// and check that every transition out of a non-HTML namespace happens
+		// at an HTML integration point. This is stricter than the parser, so
+		// some text that would be safe literally is escaped.
+		for c, p := n, n.Parent; p != nil; c, p = p, p.Parent {
+			if p.Namespace != "" && p.Namespace != c.Namespace && !htmlIntegrationPoint(p) {
+				return false
+			}
+		}
+
 		return true
 	default:
 		return false
