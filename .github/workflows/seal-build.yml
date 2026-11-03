@@ -1,0 +1,123 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'go test package/flag selector; empty runs the full suite'
+        required: false
+        default: ''
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build module-zip helper
+        shell: bash
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" ./create_mod.go
+
+      - name: Create module zip
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" golang.org/x/net v0.36.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.36.0.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.36.0.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }}${{ matrix.race && ', race' || '' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Go 1.24 + synctest experiment: compiles the go1.24-gated
+          # internal/http3 tests (their helpers are goexperiment.synctest-gated).
+          - os: ubuntu-latest
+            go: '1.24'
+            race: true
+            goexperiment: synctest
+          # go.mod minimum (go 1.23.0): exercises http2/config_pre_go124.go,
+          # which only compiles before Go 1.24. Go 1.23 has no synctest
+          # experiment; the go1.24-only internal/http3 tests are excluded by
+          # their build tags. Same command as the 0.36.0-sp1 CI (-race).
+          - os: ubuntu-latest
+            go: '1.23'
+            race: true
+            goexperiment: ''
+          - os: macos-latest
+            go: '1.24'
+            race: false
+            goexperiment: synctest
+          - os: windows-latest
+            go: '1.24'
+            race: false
+            goexperiment: synctest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      GOEXPERIMENT: ${{ matrix.goexperiment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Download and verify dependencies
+        shell: bash
+        run: |
+          set -eux
+          go version
+          go mod download
+          go mod verify
+
+      - name: Build
+        shell: bash
+        run: |
+          set -eux
+          go build -v ./...
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euxo pipefail
+          go test -v -count=1 ${{ matrix.race && '-race' || '' }} ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          awk '
+            { sub(/\r$/, "") }
+            /^=== RUN/ { cur = $3; r[cur] = ""; next }
+            /^=== (CONT|NAME)/ { cur = $3; next }
+            /^[ \t]*--- PASS:/ { pass++; next }
+            /^[ \t]*--- FAIL:/ { fail++; print "FAILED: " $3; next }
+            /^[ \t]*--- SKIP:/ { skip++; print "SKIPPED: " $3 " -- reason:" r[$3]; next }
+            /^ok[ \t]/ { okpkg++; next }
+            /^FAIL[ \t]/ { failpkg++; next }
+            /^[ \t]+[A-Za-z0-9_.-]+\.go:[0-9]+:/ { if (cur != "") { line = $0; sub(/^[ \t]+/, "", line); r[cur] = r[cur] " " line } }
+            END {
+              printf "TEST SUMMARY: %d tests passed, %d failed, %d skipped; %d packages ok, %d packages failed\n", pass, fail, skip, okpkg, failpkg
+            }
+          ' "$RUNNER_TEMP/go-test.log"
